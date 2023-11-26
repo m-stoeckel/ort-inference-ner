@@ -1,13 +1,14 @@
-from transformers import DistilBertForTokenClassification, DistilBertTokenizer
+import json
+
+from transformers import DistilBertForTokenClassification, DistilBertTokenizerFast
 
 
 if __name__ == "__main__":
     model = DistilBertForTokenClassification.from_pretrained(
         "Davlan/distilbert-base-multilingual-cased-ner-hrl"
     )
-    tokenizer = DistilBertTokenizer.from_pretrained(
+    tokenizer = DistilBertTokenizerFast.from_pretrained(
         "Davlan/distilbert-base-multilingual-cased-ner-hrl",
-        use_fast=True,
     )
     sentences = [
         "My name is Clara and I live in Berkeley, California.",
@@ -20,8 +21,10 @@ if __name__ == "__main__":
         truncation=True,
         max_length=512,
         padding=True,
+        return_offsets_mapping=True,
         return_tensors="pt",
     )
+    offset_mapping = tokens.pop("offset_mapping")
     outputs = model(**tokens)
 
     label_map = [
@@ -36,17 +39,26 @@ if __name__ == "__main__":
         "I-LOC",
     ]
 
+    tokens.fromkeys
     annot = []
-    for ts, ps in zip(tokens.input_ids, outputs.logits.argmax(2)):
-        s_annot = []
+    for idx, (ts, os, ps) in enumerate(
+        zip(tokens.input_ids, offset_mapping, outputs.logits.argmax(2))
+    ):
+        word_ids = tokens.word_ids(idx)
         tt = tokenizer.batch_decode([[t] for t in ts])
-        for i, t, p in zip(ts, tt, ps):
-            match i:
-                case _ if i < 104:
-                    continue
-                case _:
-                    s_annot.append((t, label_map[p]))
-        annot.append(s_annot)
+        annot_s = []
+        for idx, (i, o, p) in enumerate(zip(ts, os.tolist(), ps)):
+            if i > 103 and p != 0:
+                if word_ids[idx] == word_ids[idx - 1]:
+                    annot_s[-1]["end"] = o[1]
+                else:
+                    annot_s.append(
+                        {
+                            "label": label_map[p],
+                            "begin": o[0],
+                            "end": o[1],
+                        }
+                    )
+        annot.append(annot_s)
 
-    for s_annot in annot:
-        print(s_annot)
+    print(json.dumps(annot, indent=2))
