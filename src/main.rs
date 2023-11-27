@@ -34,44 +34,52 @@ fn zero_pad_vec_to_length(vec: Vec<i64>, ncols: usize) -> Result<Vec<i64>, anyho
     }
 }
 
-#[derive(serde::Serialize, Debug)]
+#[derive(Debug, PartialEq, Eq)]
+enum Entity {
+    MISC,
+    PER,
+    ORG,
+    LOC
+}
+
+#[derive(Debug)]
 enum Label {
     O,
-    #[serde(rename = "B-MISC")]
-    BMisc,
-    #[serde(rename = "I-MISC")]
-    IMisc,
-    #[serde(rename = "B-PER")]
-    BPer,
-    #[serde(rename = "I-PER")]
-    IPer,
-    #[serde(rename = "B-ORG")]
-    BOrg,
-    #[serde(rename = "I-ORG")]
-    IOrg,
-    #[serde(rename = "B-LOC")]
-    BLoc,
-    #[serde(rename = "I-LOC")]
-    ILoc,
+    B(Entity),
+    I(Entity)
 }
 
 impl From<usize> for Label {
     fn from(value: usize) -> Self {
         match value {
             0 => Label::O,
-            1 => Label::BMisc,
-            2 => Label::IMisc,
-            3 => Label::BPer,
-            4 => Label::IPer,
-            5 => Label::BOrg,
-            6 => Label::IOrg,
-            7 => Label::BLoc,
-            8 => Label::ILoc,
-            9 => Label::ILoc,
+            1 => Label::B(Entity::MISC),
+            2 => Label::I(Entity::MISC),
+            3 => Label::B(Entity::PER),
+            4 => Label::I(Entity::PER),
+            5 => Label::B(Entity::ORG),
+            6 => Label::I(Entity::ORG),
+            7 => Label::B(Entity::LOC),
+            8 => Label::I(Entity::LOC),
             _ => panic!("Label index out of bounds: {value}"),
         }
     }
 }
+
+impl serde::Serialize for Label {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+        match self {
+            Label::O => serializer.serialize_str("O"),
+            // Label::B(e) => serializer.serialize_str(&format!("B-{e:?}")),
+            // Label::I(e) => serializer.serialize_str(&format!("I-{e:?}")),
+            Label::B(e) => serializer.serialize_str(&format!("{e:?}")),
+            Label::I(e) => serializer.serialize_str(&format!("{e:?}")),
+        }
+    }
+}
+
 
 #[derive(serde::Serialize, Debug)]
 struct Annotation {
@@ -81,9 +89,9 @@ struct Annotation {
 }
 
 impl Annotation {
-    fn new(label_id: usize, begin: u32, end: u32) -> Self {
+    fn new(label: Label, begin: u32, end: u32) -> Self {
         Annotation {
-            label: Label::from(label_id),
+            label,
             begin,
             end,
         }
@@ -212,6 +220,7 @@ fn main() -> anyhow::Result<()> {
         .map(|(ts, ps)|{
             let mut annotations: Vec<Annotation> = Vec::new();
             for ((t, m), p) in std::iter::zip(std::iter::zip(&ts.token_offsets, &ts.mask), &ps) {
+                let label = Label::from(*p);
                 match (t, m) {
                     (_, Mask::Special) => continue,
                     (Some(o), Mask::Continuation) => match annotations.last_mut() {
@@ -219,7 +228,16 @@ fn main() -> anyhow::Result<()> {
                         None => panic!("Got a continuation token without preceeding ordinary token! {ts:#?} {ps:#?}"),
                     },
                     (Some(o), _) => {
-                        annotations.push(Annotation::new(*p, o.begin, o.end))
+                        if let Some(last_annotation) = annotations.last_mut() {
+                            match (&last_annotation.label, &label) {
+                                (Label::B(e) | Label::I(e), Label::I(n)) if e == n => {
+                                    last_annotation.end = o.end;
+                                    continue;
+                                }
+                                _ => ()
+                            }
+                        }
+                        annotations.push(Annotation::new(label, o.begin, o.end))
                     }
                     _ => continue,
                 };
