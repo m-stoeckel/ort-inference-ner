@@ -10,8 +10,7 @@ anyhow = "1.0.75"
 clap = { version = "4.4.8", features = ["derive"] }
 ndarray = "0.15.1"
 ndarray-stats = "0.5.1"
-# ort = { version = "2.0.0-alpha.1", features = ["cuda"] }
-ort = { git = "https://github.com/pykeio/ort", revision = "0777acb3a1b829d7b7127bc9c375dac55803ddd0", features = ["ndarray", "half", "download-binaries", "copy-dylibs", "cuda", "xnnpack"] }
+ort = { version = "2.0.0-alpha.2", features = ["ndarray", "half", "download-binaries", "copy-dylibs", "cuda"] }
 rayon = "1.8.0"
 rust_tokenizers = "8.1.1"
 serde = "1.0.193"
