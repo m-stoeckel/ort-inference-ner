@@ -1,27 +1,8 @@
 import json
-
-from itertools import islice
-
-import torch
+from argparse import ArgumentParser
 
 from torch.utils.data import Dataset
-
-from transformers import (
-    DistilBertForTokenClassification,
-    DistilBertTokenizerFast,
-    pipeline,
-)
-
-
-def batched(iterable, n):
-    "Batch data into tuples of length n. The last batch may be shorter."
-    # batched('ABCDEFG', 3) --> ABC DEF G
-    if n < 1:
-        raise ValueError("n must be at least one")
-    it = iter(iterable)
-    while batch := tuple(islice(it, n)):
-        yield batch
-
+from transformers import pipeline
 
 label_map = [
     "O",
@@ -47,42 +28,59 @@ class SentDataset(Dataset):
     def __getitem__(self, i):
         return self.sentences[i]
 
+    def __iter__(self):
+        return iter(self.sentences)
+
 
 if __name__ == "__main__":
-    # model = DistilBertForTokenClassification.from_pretrained(
-    #     "Davlan/distilbert-base-multilingual-cased-ner-hrl"
-    # )
-    # model.eval()
-    # tokenizer = DistilBertTokenizerFast.from_pretrained(
-    #     "Davlan/distilbert-base-multilingual-cased-ner-hrl",
-    # )
+    parser = ArgumentParser()
+    parser.add_argument("-d", "--device", type=str, default="cpu")
+    parser.add_argument("--cpu", dest="device", action="store_const", const="cpu")
+    parser.add_argument("--cuda", dest="device", action="store_const", const="cuda")
+    parser.add_argument("--gpu", dest="device", action="store_const", const="cuda")
+    parser.add_argument("--device_id", type=int, default=0)
+    parser.add_argument("-b", "--batch_size", type=int, default=16)
+    parser.add_argument(
+        "--aggregation",
+        type=str,
+        default="average",
+        choices=("average", "none", "max"),
+    )
+    parser.add_argument(
+        "-nb",
+        "--nb",
+        "--no_batch",
+        dest="batch_size",
+        action="store_const",
+        const=None,
+    )
+    parser.add_argument("corpus", type=str)
+
+    args = parser.parse_args()
+
+    match args.device:
+        case "cuda":
+            device = f"cuda:{args.device_id}"
+        case device:
+            device = device
+
     token_classifier = pipeline(
+        "ner",
         model="Davlan/distilbert-base-multilingual-cased-ner-hrl",
-        # aggregation_strategy="none",
-        aggregation_strategy="average",
-        # device="cpu",
-        device=0,
+        aggregation_strategy=args.aggregation,
+        device=device,
     )
 
-    with open(
-        "/hot_storage/Data/Leipzig/deu/deu_wikipedia_2021_10K-1k_shuf.txt",
-        "r",
-        encoding="utf-8",
-    ) as fp:
+    with open(args.corpus, "r", encoding="utf-8") as fp:
         sentences = SentDataset([l.strip() for l in fp])
 
-    # sentences = SentDataset(
-    #     [
-    #         "My name is Clara and I live in Berkeley, California.",
-    #         "I saw Barack Obama at the White House today.",
-    #         "Ich habe gestern die Goethe Universität in Frankfurt am Main besucht.",
-    #         "Nader Jokhadar had given Syria the lead with a well-struck header in the seventh minute.",
-    #     ]
-    # )
-
     annot = []
-    # for out in (token_classifier(s) for s in sentences):
-    for out in token_classifier(sentences, batch_size=16):
+    it = (
+        token_classifier(sentences, batch_size=args.batch_size)
+        if args.batch_size is not None
+        else (token_classifier(s) for s in sentences)
+    )
+    for out in it:
         s = [
             {
                 "label": pred.get("entity") or pred.get("entity_group"),
@@ -91,36 +89,7 @@ if __name__ == "__main__":
             }
             for pred in out
         ]
-        if s:
-            annot.append(s)
-        # tokens = tokenizer(
-        #     batch,
-        #     truncation=True,
-        #     max_length=512,
-        #     padding=True,
-        #     return_offsets_mapping=True,
-        #     return_tensors="pt",
-        # )
-        # offset_mapping = tokens.pop("offset_mapping")
+        annot.append(s)
 
-        # for idx, (ts, os, ps) in enumerate(
-        #     zip(tokens.input_ids, offset_mapping, outputs.logits.argmax(2))
-        # ):
-        #     word_ids = tokens.word_ids(idx)
-        #     tt = tokenizer.batch_decode([[t] for t in ts])
-        #     annot_s = []
-        #     for idx, (i, o, p) in enumerate(zip(ts, os.tolist(), ps)):
-        #         if i > 103:  # and p != 0:
-        #             if word_ids[idx] == word_ids[idx - 1]:
-        #                 annot_s[-1]["end"] = o[1]
-        #             else:
-        #                 annot_s.append(
-        #                     {
-        #                         "label": label_map[p],
-        #                         "begin": o[0],
-        #                         "end": o[1],
-        #                     }
-        #                 )
-        #     annot.append(annot_s)
-
-    print(json.dumps(annot, indent=2))
+    with open("pipelines.json", "w") as fp:
+        json.dump(annot, fp, indent=2)
