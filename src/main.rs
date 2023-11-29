@@ -1,11 +1,15 @@
+use std::borrow::BorrowMut;
 use std::cmp::Ordering;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
 use clap::{Parser, ValueEnum};
 use ndarray::{Array2, Axis};
 use ndarray_stats::QuantileExt;
-use ort::{Session, CUDAExecutionProvider, ExecutionProvider, TensorRTExecutionProvider};
+use ort::{CUDAExecutionProvider, ExecutionProvider, Session};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSlice;
 use rust_tokenizers::tokenizer::{BertTokenizer, Tokenizer, TruncationStrategy};
 use rust_tokenizers::vocab::{BertVocab, Vocab};
 use rust_tokenizers::Mask;
@@ -34,19 +38,27 @@ fn zero_pad_vec_to_length(vec: Vec<i64>, ncols: usize) -> Result<Vec<i64>, anyho
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+enum Aggregation {
+    None,
+    Last,
+    Strict,
+}
+
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq, Eq)]
 enum Entity {
     MISC,
     PER,
     ORG,
-    LOC
+    LOC,
 }
 
 #[derive(Debug)]
 enum Label {
     O,
     B(Entity),
-    I(Entity)
+    I(Entity),
 }
 
 impl From<usize> for Label {
@@ -69,7 +81,8 @@ impl From<usize> for Label {
 impl serde::Serialize for Label {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer {
+        S: serde::Serializer,
+    {
         match self {
             Label::O => serializer.serialize_str("O"),
             // Label::B(e) => serializer.serialize_str(&format!("B-{e:?}")),
@@ -80,7 +93,6 @@ impl serde::Serialize for Label {
     }
 }
 
-
 #[derive(serde::Serialize, Debug)]
 struct Annotation {
     label: Label,
@@ -90,180 +102,218 @@ struct Annotation {
 
 impl Annotation {
     fn new(label: Label, begin: u32, end: u32) -> Self {
-        Annotation {
-            label,
-            begin,
-            end,
-        }
+        Annotation { label, begin, end }
     }
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
-enum ImplementedProviders{
+enum ImplementedProviders {
     CPU,
     CUDA,
-    TensorRT,
 }
+
+const DEFAULT_MODEL_PATH: &str = "data/model.onnx";
+const DEFAULT_VOCAB_PATH: &str = "data/vocab.txt";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value="cpu")]
-    provider: ImplementedProviders,
+    #[arg(short, long, default_value = "cpu")]
+    device: ImplementedProviders,
 
-    #[arg(short, long, default_value_t = 0)]
-    device: u8,
+    #[arg(long, default_value_t = 0)]
+    device_id: usize,
+
+    #[arg(short, long)]
+    threads: Option<usize>,
+
+    #[arg(short, long, default_value_t = 128)]
+    batch_size: usize,
+
+    #[arg(short, long, default_value = DEFAULT_MODEL_PATH)]
+    model: PathBuf,
+
+    #[arg(short, long, default_value = DEFAULT_VOCAB_PATH)]
+    vocab: PathBuf,
+
+    #[arg(short, long, value_enum, default_value = "last")]
+    aggregation: Aggregation,
+
+    #[arg()]
+    corpus: PathBuf,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    
+
     let builder = Session::builder()?;
 
-    match args.provider {
+    let threads = args
+        .threads
+        .map_or_else(
+            || std::thread::available_parallelism().map_err(anyhow::Error::from),
+            |v| NonZeroUsize::new(v).ok_or(anyhow!("Number of threads must be > 0!")),
+        )?
+        .get() as i16;
+
+    match args.device {
         ImplementedProviders::CPU => (),
         ImplementedProviders::CUDA => {
-            let cuda = CUDAExecutionProvider::default();
+            let cuda = CUDAExecutionProvider::default().with_device_id(args.device_id as i32);
             if let Err(err) = cuda.register(&builder) {
-                Err(anyhow!("Failed to register CUDA execution provider: {err:?}"))?
+                Err(anyhow!(
+                    "Failed to register CUDA execution provider: {err:?}"
+                ))?
             }
         }
-        ImplementedProviders::TensorRT => {
-            let tensor = TensorRTExecutionProvider::default();
-            if let Err(err) = tensor.register(&builder) {
-                Err(anyhow!("Failed to register TensorRT execution provider: {err:?}"))?
-            }
-        },
-
     }
+    let corpus_path = args.corpus;
+    let model_path = args.model;
+    let vocab_path = args.vocab;
 
     ort::init()
         // .with_execution_providers([CPUExecutionProvider::default().build()])
         .commit()?;
 
+    let corpus: Vec<String> = std::fs::read_to_string(corpus_path)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let vocab = BertVocab::from_file(vocab_path)?;
+    let tokenizer = BertTokenizer::from_existing_vocab(vocab, false, false);
+
     let session = builder
-		// .with_optimization_level(GraphOptimizationLevel::Level1)?
-        .with_parallel_execution(true)?
-		.with_intra_threads(12)?
-        .with_model_from_file("/run/media/mastoeck/hot_storage/ONNX/distilbert-base-multilingual-cased-ner-hrl/model.onnx")?;
+        // .with_optimization_level(GraphOptimizationLevel::Level1)?
+        .with_parallel_execution(threads > 1)?
+        .with_intra_threads(threads)?
+        .with_model_from_file(model_path)?;
 
-    let tokenizer = BertTokenizer::from_existing_vocab(
-        BertVocab::from_file(PathBuf::from("/run/media/mastoeck/hot_storage/ONNX/distilbert-base-multilingual-cased-ner-hrl/vocab.txt"))?,
-        false,
-        false,
+    let annotations = run_prediction(
+        corpus,
+        args.batch_size,
+        args.aggregation,
+        tokenizer,
+        session,
     );
-    let corpus: Vec<String> =
-        std::fs::read_to_string("/hot_storage/Data/Leipzig/deu/deu_wikipedia_2021_10K-1k_shuf.txt")
-            .unwrap()
-            .lines()
-            .map(String::from)
-            .filter(|s| !s.is_empty())
-            .collect();
-    // let corpus = [
-    //     "My name is Clara and I live in Berkeley, California.",
-    //     "I saw Barack Obama at the White House today.",
-    //     "Ich habe gestern die Goethe Universität in Frankfurt am Main besucht.",
-    //     "Nader Jokhadar had given Syria the lead with a well-struck header in the seventh minute.",
-    // ];
+    let json_string = serde_json::to_string_pretty(&annotations?).unwrap();
+    println!("{json_string}");
+    Ok(())
+}
 
-    let annot: Vec<Vec<Annotation>> = corpus
-        .chunks(128)
-        .map(|batch| {
-            let tokens = tokenizer.encode_list(
-                batch,
-                512,
-                &TruncationStrategy::LongestFirst,
-                0,
-            );
-
+fn run_prediction(
+    corpus: Vec<String>,
+    chunk_size: usize,
+    aggregation: Aggregation,
+    tokenizer: BertTokenizer,
+    session: Session,
+) -> anyhow::Result<Vec<Vec<Annotation>>> {
+    let annotations: Vec<Vec<Annotation>> = corpus
+        .par_chunks(chunk_size)
+        .map(|batch| tokenizer.encode_list(batch, 512, &TruncationStrategy::LongestFirst, 0))
+        .map(|tokens| {
             let (input_ids, attention_mask) = get_input_ids_and_attention_masks(&tokens);
-            let input_ids:Array2<i64> = values_to_array2(input_ids).unwrap();
-            let attention_mask:Array2<i64> = values_to_array2(attention_mask).unwrap();
 
             (input_ids, attention_mask, tokens)
         })
-        // .into_iter()
-        // .map(|batch| {
-        //     let tokens = tokenizer.encode(
-        //         &batch,
-        //         None,
-        //         512,
-        //         &TruncationStrategy::LongestFirst,
-        //         0,
-        //     );
-        //     let tokens = vec![tokens];
-
-        //     let (input_ids, attention_mask) = get_input_ids_and_attention_masks(&tokens);
-        //     let input_ids:Array2<i64> = values_to_array2(input_ids).unwrap();
-        //     let attention_mask:Array2<i64> = values_to_array2(attention_mask).unwrap();
-
-        //     (input_ids, attention_mask, tokens)
-        // })
-        .map(|(input_ids, attention_mask, tokens)|{
-            let outputs  = session.run(ort::inputs![input_ids, attention_mask]?)?;
-
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|(input_ids, attention_mask, tokens)| {
+            let outputs = session.run(ort::inputs![input_ids, attention_mask]?)?;
             let preds: Vec<Vec<usize>> = outputs[0]
                 .extract_tensor::<f32>()?
                 .view()
                 .map_axis(Axis(2), |v| v.argmax())
                 .rows()
                 .into_iter()
-                .map(|r| {
-                    r.to_vec().into_iter().collect::<Result<Vec<usize>, _>>()
-                })
+                .map(|r| r.to_vec().into_iter().collect::<Result<Vec<usize>, _>>())
                 .collect::<Result<Vec<Vec<usize>>, _>>()?;
-            
-            anyhow::Ok((preds, tokens))
+            Ok((tokens, preds))
         })
-        .filter_map(anyhow::Result::ok)
-        .flat_map(|(preds, tokens)| std::iter::zip(tokens, preds))
-        .map(|(ts, ps)|{
-            let mut annotations: Vec<Annotation> = Vec::new();
-            for ((t, m), p) in std::iter::zip(std::iter::zip(&ts.token_offsets, &ts.mask), &ps) {
-                let label = Label::from(*p);
-                match (t, m) {
-                    (_, Mask::Special) => continue,
-                    (Some(o), Mask::Continuation) => match annotations.last_mut() {
-                        Some(last_annotation) => last_annotation.end = o.end,
-                        None => panic!("Got a continuation token without preceeding ordinary token! {ts:#?} {ps:#?}"),
-                    },
-                    (Some(o), _) => {
-                        if let Some(last_annotation) = annotations.last_mut() {
-                            match (&last_annotation.label, &label) {
-                                (Label::B(e) | Label::I(e), Label::I(n)) if e == n => {
-                                    last_annotation.end = o.end;
-                                    continue;
-                                }
-                                _ => ()
-                            }
-                        }
-                        annotations.push(Annotation::new(label, o.begin, o.end))
-                    }
-                    _ => continue,
-                };
-            }
-            
-            annotations
-        }).map(|annotations| {
-            annotations.into_iter()
-                .filter(|a|!matches!(a.label, Label::O))
-                .collect::<Vec<Annotation>>()
+        .collect::<Result<Vec<_>, anyhow::Error>>()?
+        .into_par_iter()
+        .flat_map(|(tokens, preds)| {
+            (tokens, preds)
+                .into_par_iter()
+                .map(|(ts, ps)| process_outputs(ts, ps, &aggregation))
+                .collect::<Vec<Vec<Annotation>>>()
         })
-        .filter(|annotations| !annotations.is_empty())
         .collect();
-    let json_string = serde_json::to_string_pretty(&annot).unwrap();
-    println!("{json_string}");
-    Ok(())
+    Ok(annotations)
 }
 
 fn get_input_ids_and_attention_masks(
     batch_encoding: &Vec<rust_tokenizers::TokenizedInput>,
-) -> (Vec<Vec<i64>>, Vec<Vec<i64>>) {
+) -> (Array2<i64>, Array2<i64>) {
     let mut input_ids: Vec<Vec<i64>> = Vec::with_capacity(batch_encoding.len());
     let mut attention_mask: Vec<Vec<i64>> = Vec::with_capacity(batch_encoding.len());
     for seq_encoding in batch_encoding.iter() {
         input_ids.push(seq_encoding.token_ids.clone());
         attention_mask.push(vec![1_i64; seq_encoding.token_ids.len()]);
     }
+    let input_ids: Array2<i64> = values_to_array2(input_ids).unwrap();
+    let attention_mask: Array2<i64> = values_to_array2(attention_mask).unwrap();
     (input_ids, attention_mask)
+}
+
+fn process_outputs(
+    tokens: rust_tokenizers::TokenizedInput,
+    predictions: Vec<usize>,
+    aggregation: &Aggregation,
+) -> Vec<Annotation> {
+    let mut annotations: Vec<Annotation> = Vec::new();
+    let mut last_annotation: Option<Annotation> = None;
+
+    let iterable = std::iter::zip(
+        std::iter::zip(&tokens.token_offsets, &tokens.mask),
+        &predictions,
+    );
+    for ((offset, mask), pred) in iterable {
+        if let Some(o) = offset {
+            match (mask, Label::from(*pred)) {
+                (Mask::Special, _) => continue,
+                (Mask::Continuation, _) => {
+                    if let Some(la) = last_annotation.borrow_mut() {
+                        la.end = o.end;
+                    } else {
+                        panic!(
+                            "Got a continuation token without preceding ordinary token! {tokens:#?} {predictions:#?}"
+                        )
+                    }
+                }
+                (_, label) => {
+                    if let Some(mut la) = last_annotation {
+                        match (aggregation, &label, &la.label) {
+                            (Aggregation::Last, Label::I(_), Label::B(_) | Label::I(_)) => {
+                                la.borrow_mut().end = o.end;
+                            }
+                            (Aggregation::Strict, Label::I(e), Label::B(n) | Label::I(n))
+                                if e == n =>
+                            {
+                                la.borrow_mut().end = o.end;
+                            }
+                            // TODO: Merge arms below?
+                            (Aggregation::None, _, _) => {
+                                annotations.push(la);
+                            }
+                            (_, Label::I(_), Label::O) => {
+                                // TODO: Emit a warning if an Inside tag follows an Outside tag?
+                                annotations.push(la)
+                            }
+                            _ => annotations.push(la),
+                        }
+                    }
+                    last_annotation = Some(Annotation::new(label, o.begin, o.end));
+                }
+            };
+        }
+    }
+
+    annotations
+        .into_iter()
+        .filter(|a| !matches!(a.label, Label::O))
+        .collect()
 }
