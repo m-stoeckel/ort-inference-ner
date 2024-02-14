@@ -1,5 +1,7 @@
 use std::borrow::BorrowMut;
 use std::cmp::Ordering;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -200,7 +202,10 @@ fn main() -> anyhow::Result<()> {
         session,
     );
     let json_string = serde_json::to_string_pretty(&annotations?).unwrap();
-    println!("{json_string}");
+    OpenOptions::new()
+        .write(true)
+        .open("ort-rs.json")?
+        .write_all(json_string.as_bytes())?;
     Ok(())
 }
 
