@@ -272,41 +272,42 @@ fn process_outputs(
         &predictions,
     );
     for ((offset, mask), pred) in iterable {
-        if let Some(o) = offset {
-            match (mask, Label::from(*pred)) {
-                (Mask::Special, _) => continue,
-                (Mask::Continuation, _) => {
+        if let Some(offset) = offset {
+            match mask {
+                Mask::Special => continue,
+                Mask::Continuation => {
                     if let Some(la) = last_annotation.borrow_mut() {
-                        la.end = o.end;
+                        la.end = offset.end;
                     } else {
                         panic!(
                             "Got a continuation token without preceding ordinary token! {tokens:#?} {predictions:#?}"
                         )
                     }
                 }
-                (_, label) => {
+                _ => {
+                    let label = Label::from(*pred);
                     if let Some(mut la) = last_annotation {
                         match (aggregation, &label, &la.label) {
                             (Aggregation::Last, Label::I(_), Label::B(_) | Label::I(_)) => {
-                                la.borrow_mut().end = o.end;
+                                la.borrow_mut().end = offset.end;
+                                last_annotation = Some(la);
+                                continue;
                             }
                             (Aggregation::Strict, Label::I(e), Label::B(n) | Label::I(n))
                                 if e == n =>
                             {
-                                la.borrow_mut().end = o.end;
+                                la.borrow_mut().end = offset.end;
+                                last_annotation = Some(la);
+                                continue;
                             }
                             // TODO: Merge arms below?
-                            (Aggregation::None, _, _) => {
-                                annotations.push(la);
-                            }
-                            (_, Label::I(_), Label::O) => {
-                                // TODO: Emit a warning if an Inside tag follows an Outside tag?
-                                annotations.push(la)
-                            }
+                            (Aggregation::None, _, _) => annotations.push(la),
+                            // TODO: Emit a warning if an Inside tag follows an Outside tag?
+                            (_, Label::I(_), Label::O) => annotations.push(la),
                             _ => annotations.push(la),
                         }
                     }
-                    last_annotation = Some(Annotation::new(label, o.begin, o.end));
+                    last_annotation = Some(Annotation::new(label, offset.begin, offset.end));
                 }
             };
         }

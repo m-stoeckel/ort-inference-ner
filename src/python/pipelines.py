@@ -39,7 +39,7 @@ if __name__ == "__main__":
     parser.add_argument("--cuda", dest="device", action="store_const", const="cuda")
     parser.add_argument("--gpu", dest="device", action="store_const", const="cuda")
     parser.add_argument("--device_id", type=int, default=0)
-    parser.add_argument("-b", "--batch_size", type=int, default=16)
+    parser.add_argument("-b", "--batch_size", type=int, default=128)
     parser.add_argument(
         "--aggregation",
         type=str,
