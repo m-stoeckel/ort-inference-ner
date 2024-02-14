@@ -2,6 +2,7 @@ import json
 
 import onnxruntime as ort
 from inference import batched, get_arg_parser, process_outputs
+from tqdm import tqdm
 from transformers import BatchEncoding, DistilBertConfig, DistilBertTokenizerFast
 
 if __name__ == "__main__":
@@ -26,7 +27,7 @@ if __name__ == "__main__":
         sentences = [l.strip() for l in fp]
 
     annot = []
-    for batch in batched(sentences, args.batch_size):
+    for batch in batched(tqdm(sentences), args.batch_size):
         tokens: BatchEncoding = tokenizer(
             batch,
             truncation=True,
@@ -49,5 +50,5 @@ if __name__ == "__main__":
                 process_outputs(tokens.word_ids(idx), ts, os, ps, args.aggregation)
             )
 
-    with open("ort-py-hf.json", "w") as fp:
+    with open("ort-hf.json", "w") as fp:
         json.dump(annot, fp, indent=2)

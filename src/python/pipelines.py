@@ -1,8 +1,10 @@
 import json
-from argparse import ArgumentParser
 
 from torch.utils.data import Dataset
+from tqdm import tqdm
 from transformers import pipeline
+
+from inference import get_arg_parser
 
 label_map = [
     "O",
@@ -33,30 +35,7 @@ class SentDataset(Dataset):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("-d", "--device", type=str, default="cpu")
-    parser.add_argument("--cpu", dest="device", action="store_const", const="cpu")
-    parser.add_argument("--cuda", dest="device", action="store_const", const="cuda")
-    parser.add_argument("--gpu", dest="device", action="store_const", const="cuda")
-    parser.add_argument("--device_id", type=int, default=0)
-    parser.add_argument("-b", "--batch_size", type=int, default=128)
-    parser.add_argument(
-        "--aggregation",
-        type=str,
-        default="average",
-        choices=("average", "none", "max"),
-    )
-    parser.add_argument(
-        "-nb",
-        "--nb",
-        "--no_batch",
-        dest="batch_size",
-        action="store_const",
-        const=None,
-    )
-    parser.add_argument("corpus", type=str)
-
-    args = parser.parse_args()
+    args = get_arg_parser(aggregation_choices=("average", "none", "max")).parse_args()
 
     match args.device:
         case "cuda":
@@ -72,7 +51,7 @@ if __name__ == "__main__":
     )
 
     with open(args.corpus, "r", encoding="utf-8") as fp:
-        sentences = SentDataset([l.strip() for l in fp])
+        sentences = SentDataset(tqdm([l.strip() for l in fp]))
 
     annot = []
     it = (

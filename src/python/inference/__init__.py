@@ -89,7 +89,7 @@ LABEL_MAP: Final[List[Label]] = [
 ]
 
 
-def get_arg_parser():
+def get_arg_parser(aggregation_choices=("last", "strict", "none")):
     parser = ArgumentParser()
     parser.add_argument("-d", "--device", type=str, default="cpu")
     parser.add_argument("--cpu", dest="device", action="store_const", const="cpu")
@@ -109,8 +109,8 @@ def get_arg_parser():
         "-a",
         "--aggregation",
         type=str,
-        default="last",
-        choices=("last", "strict", "none"),
+        default=aggregation_choices[0],
+        choices=aggregation_choices,
     )
     parser.add_argument("corpus", type=str)
     return parser

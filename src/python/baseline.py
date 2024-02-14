@@ -2,6 +2,7 @@ import json
 
 import torch
 from inference import batched, get_arg_parser, parse_args_device, process_outputs
+from tqdm import tqdm
 from transformers import (
     BatchEncoding,
     DistilBertConfig,
@@ -29,7 +30,7 @@ if __name__ == "__main__":
         sentences = [l.strip() for l in fp]
 
     annot = []
-    for batch in batched(sentences, args.batch_size):
+    for batch in batched(tqdm(sentences), args.batch_size):
         tokens: BatchEncoding = tokenizer(
             batch,
             truncation=True,
